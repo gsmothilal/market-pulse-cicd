@@ -1,13 +1,16 @@
 import argparse
 import boto3
-import sagemaker
 import pandas as pd
 import yfinance as yf
 import os
+import time
+import json
+import sagemaker # We only import this to get the session, not for submodules
 
-# --- FIXED: Use the Universal 'Estimator' instead of specific 'XGBoost' ---
-# This class exists in ALL versions of SageMaker, so it cannot crash.
-from sagemaker.estimator import Estimator
+# --- CONFIGURATION ---
+REGION = "us-east-1"
+# Hardcoded XGBoost Image for us-east-1 (Standard & Stable)
+IMAGE_URI = "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.0-1-cpu-py3"
 
 # --- 1. SETUP ---
 parser = argparse.ArgumentParser()
@@ -19,7 +22,6 @@ role = args.role
 bucket = args.bucket
 prefix = 'marketpulse-real-history'
 symbols = ['AAPL', 'GOOGL', 'AMZN', 'MSFT', 'TSLA']
-region = "us-east-1"
 
 print(f"✅ Using Role: {role}")
 print(f"✅ Using Bucket: {bucket}")
@@ -48,43 +50,99 @@ if data_frames:
 else:
     raise Exception("❌ No data downloaded!")
 
-# --- 3. UPLOAD & TRAIN ---
-boto_session = boto3.Session(region_name=region)
-sess = sagemaker.Session(boto_session=boto_session)
-s3 = boto_session.resource('s3')
+# --- 3. UPLOAD DATA ---
+s3 = boto3.client('s3', region_name=REGION)
+s3.upload_file('train.csv', bucket, f"{prefix}/train/train.csv")
+s3_train_path = f"s3://{bucket}/{prefix}/train/train.csv"
+output_path = f"s3://{bucket}/{prefix}/output"
 
-print("⬆️ Uploading to S3...")
-s3.Bucket(bucket).Object(os.path.join(prefix, 'train/train.csv')).upload_file('train.csv')
-s3_train_path = f's3://{bucket}/{prefix}/train'
+# --- 4. TRAIN (Using Pure Boto3) ---
+sm = boto3.client('sagemaker', region_name=REGION)
+job_name = f"market-pulse-xgboost-{int(time.time())}"
 
-print("⏳ Training Model...")
-# Use version 1.0-1 which is very stable
-container = sagemaker.image_uris.retrieve("xgboost", region, "1.0-1")
+print(f"⏳ Starting Training Job: {job_name}")
 
-# --- FIXED: Using generic Estimator ---
-xgb = Estimator(
-    image_uri=container,
-    role=role,
-    instance_count=1,
-    instance_type='ml.m5.large',
-    output_path=f's3://{bucket}/{prefix}/output',
-    sagemaker_session=sess
+sm.create_training_job(
+    TrainingJobName=job_name,
+    AlgorithmSpecification={
+        'TrainingImage': IMAGE_URI,
+        'TrainingInputMode': 'File'
+    },
+    RoleArn=role,
+    InputDataConfig=[{
+        'ChannelName': 'train',
+        'DataSource': {
+            'S3DataSource': {
+                'S3DataType': 'S3Prefix',
+                'S3Uri': s3_train_path,
+                'S3DataDistributionType': 'FullyReplicated'
+            }
+        },
+        'ContentType': 'csv',
+        'CompressionType': 'None'
+    }],
+    OutputDataConfig={'S3OutputPath': output_path},
+    ResourceConfig={
+        'InstanceType': 'ml.m5.large',
+        'InstanceCount': 1,
+        'VolumeSizeInGB': 10
+    },
+    StoppingCondition={'MaxRuntimeInSeconds': 3600},
+    HyperParameters={
+        'objective': 'reg:squarederror',
+        'num_round': '50'
+    }
 )
 
-# This works the same way as the specific class
-xgb.set_hyperparameters(objective='reg:squarederror', num_round=50)
+# Wait for training to finish
+print("   Waiting for training to complete...")
+waiter = sm.get_waiter('training_job_completed_or_stopped')
+waiter.wait(TrainingJobName=job_name)
+print("✅ Training Complete.")
 
-# Pass the input path directly
-xgb.fit({'train': s3_train_path})
+# --- 5. DEPLOY (Using Pure Boto3) ---
+model_name = f"market-pulse-model-{int(time.time())}"
+print(f"🚀 Creating Model: {model_name}")
 
-# --- 4. DEPLOY ---
-print("🚀 Deploying Endpoint...")
+# Create Model Object
+sm.create_model(
+    ModelName=model_name,
+    PrimaryContainer={
+        'Image': IMAGE_URI,
+        'ModelDataUrl': f"{output_path}/{job_name}/output/model.tar.gz"
+    },
+    ExecutionRoleArn=role
+)
+
+# Create Endpoint Config
+endpoint_config_name = f"market-pulse-config-{int(time.time())}"
+sm.create_endpoint_config(
+    EndpointConfigName=endpoint_config_name,
+    ProductionVariants=[{
+        'InstanceType': 'ml.t2.medium',
+        'InitialInstanceCount': 1,
+        'ModelName': model_name,
+        'VariantName': 'AllTraffic'
+    }]
+)
+
+endpoint_name = 'market-pulse-predictor'
+print(f"🚀 Deploying to Endpoint: {endpoint_name}")
+
 try:
-    xgb.deploy(
-        initial_instance_count=1,
-        instance_type='ml.t2.medium',
-        endpoint_name='market-pulse-predictor'
+    # Try creating new endpoint
+    sm.create_endpoint(
+        EndpointName=endpoint_name,
+        EndpointConfigName=endpoint_config_name
     )
-    print("✅ Endpoint Deployed!")
-except Exception as e:
-    print(f"⚠️ Endpoint might already exist: {e}")
+    print("   Creating new endpoint... (This takes ~5-10 mins)")
+    # We won't wait here to save GitHub Action minutes, it runs in background
+except sm.exceptions.ResourceInUseException:
+    print("   Endpoint already exists. Updating...")
+    sm.update_endpoint(
+        EndpointName=endpoint_name,
+        EndpointConfigName=endpoint_config_name
+    )
+    print("   Update command sent.")
+
+print("✅ DONE! System is live.")
