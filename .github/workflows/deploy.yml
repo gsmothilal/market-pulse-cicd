@@ -1,0 +1,49 @@
+name: Zero Touch Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy_and_train:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_wrapper: false 
+
+    - name: Terraform Apply
+      id: tf
+      run: |
+        terraform init
+        terraform apply -auto-approve
+        echo "ROLE_ARN=$(terraform output -raw sagemaker_role_arn)" >> $GITHUB_ENV
+        echo "BUCKET_NAME=$(terraform output -raw s3_bucket_name)" >> $GITHUB_ENV
+      working-directory: ./infra
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Dependencies
+      run: pip install boto3 sagemaker pandas yfinance
+
+    - name: Train and Deploy AI
+      run: |
+        python scripts/train_model.py --role "$ROLE_ARN" --bucket "$BUCKET_NAME"

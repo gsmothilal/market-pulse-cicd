@@ -1,0 +1,7 @@
+.DS_Store
+*.tfstate
+*.tfstate.backup
+.terraform/
+__pycache__/
+*.zip
+.ipynb_checkpoints/
